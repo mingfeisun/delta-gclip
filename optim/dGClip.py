@@ -56,4 +56,4 @@ class dGClip(torch.optim.Optimizer):
                     p.grad = p.grad.add(p, alpha=param_group["weight_decay"])
                 p.add_(p.grad, alpha=-step_size)
 
-        return loss
+        return gradient_norm

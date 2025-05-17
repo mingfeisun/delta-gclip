@@ -1,14 +1,21 @@
 import torch
 from torch import nn
 import argparse
+import numpy as np
+
+from datetime import datetime
 
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
+from torch.utils.tensorboard import SummaryWriter
+
 from vision_transformer import vit_tiny
 
+import sys
+sys.path.insert(1, '../optim')
+
 def count_vars(module):
-    import numpy as np
     return sum([np.prod(p.shape) for p in module.parameters()])
 
 def read_cifar(path, if_autoencoder=False):
@@ -79,13 +86,19 @@ def class_accuracy(predictions, labels):
     return torch.mean(y.eq(y_labels).float())
 
 def train_vit(args):
+    seed = args.seed
+    if seed is None:
+        seed = np.random.randint(1e6) # different seeds for each process
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     train_loader, _, test_loader = load_dataset(64)
 
     model = vit_tiny(num_classes=10)
     print('Number of parameters: ', count_vars(model))
-
-    lr = args.lr
-    weight_decay = 1e-5
 
     device = torch.device(f'cuda:{args.device}') # Select best available device
 
@@ -95,24 +108,29 @@ def train_vit(args):
     if args.optim == 'adam':
         opt = torch.optim.Adam(
             model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
         )
     elif args.optim == 'dgclip':
         from dGClip import dGClip
         opt = dGClip(
             model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
+            lr=args.lr,
+            gamma=args.gamma,
+            delta=args.delta,
+            weight_decay=args.weight_decay,
         )
     elif args.optim == 'sgd':
         opt = torch.optim.SGD(
             model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
         )
     else: 
         raise ValueError(f"Unknown optimizer: {args.optim}")
+
+    time_now = datetime.now().strftime('%Y%m%d-%H%M%S')
+    writer = SummaryWriter(log_dir=f'logs/vit_cifar.{args.optim}.{args.lr}.{args.gamma}.{args.delta}.{args.weight_decay}.{time_now}_{seed}', comment='vit_cifar')
 
     import time
     st = time.time()
@@ -125,6 +143,9 @@ def train_vit(args):
         with tqdm(train_loader, unit="batch") as tepoch:
             running_loss = 0
             running_acc = 0
+            clip_times = 0
+
+            model.train()
             for n, (batch_data, batch_labels) in enumerate(tepoch, start=1):
                 tepoch.set_description(f"Epoch {epoch}")
 
@@ -134,7 +155,10 @@ def train_vit(args):
                 output = model(batch_data)
                 loss = criterion(output, batch_labels)
                 loss.backward()
-                opt.step()
+                grad_norm = opt.step()
+                if grad_norm is None:
+                    grad_norm = 1.0
+                clip_times += args.delta < args.gamma / grad_norm
 
                 acc = class_accuracy(output, batch_labels)
 
@@ -143,44 +167,49 @@ def train_vit(args):
 
                 et = time.time()     
 
-                if n % 50 == 0:
-                    model.eval()
-
-                    running_test_loss = 0
-                    running_test_acc = 0
-
-                    for m, (test_batch_data, test_batch_labels) in enumerate(test_loader, start=1):
-                        test_batch_data, test_batch_labels = test_batch_data.to(device), test_batch_labels.to(device)
-
-                        test_output = model(test_batch_data)
-
-                        test_loss = criterion(test_output, test_batch_labels).item()
-                        test_acc = class_accuracy(test_output, test_batch_labels).item()
-
-                        running_test_loss += test_loss
-                        running_test_acc += test_acc
-
-                    running_test_loss /= m
-                    running_test_acc /= m
-
-                    n_test_steps += 1
-                    tepoch.set_postfix(acc=100 * running_acc / n, test_acc=running_test_acc * 100)
-                    print(f"Epoch {epoch}, step {n}, loss: {running_loss / n:.3f}, test_loss: {running_test_loss:.3f}, acc: {running_acc / n:.3f}, test_acc: {running_test_acc:.3f}")
-                    model.train()
-                    eval_time += time.time() - et
-            
                 n_steps += 1
+
+            running_test_loss = 0
+            running_test_acc = 0
+            model.eval()
+            for m, (test_batch_data, test_batch_labels) in enumerate(test_loader, start=1):
+                test_batch_data, test_batch_labels = test_batch_data.to(device), test_batch_labels.to(device)
+
+                test_output = model(test_batch_data)
+
+                test_loss = criterion(test_output, test_batch_labels).item()
+                test_acc = class_accuracy(test_output, test_batch_labels).item()
+
+                running_test_loss += test_loss
+                running_test_acc += test_acc
+
+            running_test_loss /= m+1
+            running_test_acc /= m+1
+
+            n_test_steps += 1
+            tepoch.set_postfix(acc=100 * running_acc / n, test_acc=running_test_acc * 100)
+            writer.add_scalar('train_loss', running_loss / n, epoch)
+            writer.add_scalar('train_acc', running_acc / n, epoch)
+            writer.add_scalar('test_loss', running_test_loss, epoch)
+            writer.add_scalar('test_acc', running_test_acc, epoch)
+            writer.add_scalar('grad_norm', grad_norm, epoch)
+            writer.add_scalar('grad_clip_ratio', clip_times * 1.0 / n, epoch)
+
+            print(f"Epoch {epoch}, step {n}, loss: {running_loss / n:.3f}, test_loss: {running_test_loss:.3f}, acc: {running_acc / n:.3f}, test_acc: {running_test_acc:.3f}, grad_norm: {grad_norm:.3f}")
+            eval_time += time.time() - et
 
             epoch_time = time.time() - st - eval_time
             tepoch.set_postfix(loss=running_loss / n, test_loss=running_test_loss, epoch_time=epoch_time)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PyTorch CIFAR ViT Training')
-    parser.add_argument('--optim', default='adam', choices=['adam', 'dgclip', 'sgd'],)
+    parser.add_argument('--optim', default='dgclip', choices=['adam', 'dgclip', 'sgd'],)
     parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
     parser.add_argument('--lr', default=0.0005, type=float, help='learning rate')
     parser.add_argument('--gamma', default=1.0, type=float, help='gamma')
+    parser.add_argument('--delta', default=0.001, type=float, help='delta')
     parser.add_argument('--weight_decay', default=1e-5, type=float, help='weight decay')
+    parser.add_argument('--seed', default=None, type=int, help='random seed (default: None)')
     parser.add_argument('--device', default=0, type=int, help='GPU device')
     args = parser.parse_args()
 

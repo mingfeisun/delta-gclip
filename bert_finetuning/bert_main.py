@@ -1,312 +1,224 @@
-import pandas as pd
-from dGClip_bert import *
-import sys
+import os
+import torch
+import time
+import pickle
+import random
+import argparse
+import numpy as np
 
-df = pd.read_csv('train_sub.csv')
+from datetime import datetime
+
+import sys
+sys.path.insert(1, '../optim')
+from dGClip import dGClip
+
+from torch.utils.tensorboard import SummaryWriter
 
 from transformers import DistilBertTokenizer
-
-tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased', do_lower_case=True)
-
-texts = df['question_text'].values
-labels = df['target'].values
-text_ids = [tokenizer.encode(text, max_length=300, pad_to_max_length=True) for text in texts]
-
-
-att_masks = []
-for ids in text_ids:
-    masks = [int(id > 0) for id in ids]
-    att_masks.append(masks)
-
-
-from sklearn.model_selection import train_test_split
-
-train_x, test_val_x, train_y, test_val_y = train_test_split(text_ids, labels, random_state=111, test_size=0.2)
-train_m, test_val_m = train_test_split(att_masks, random_state=111, test_size=0.2)
-
-test_x, val_x, test_y, val_y = train_test_split(test_val_x, test_val_y, random_state=111, test_size=0.5)
-test_m, val_m = train_test_split(test_val_m, random_state=111, test_size=0.5)
-
-from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
-
-batch_size = 32
-
-import torch
-
-train_x = torch.tensor(train_x)
-test_x = torch.tensor(test_x)
-val_x = torch.tensor(val_x)
-train_y = torch.tensor(train_y)
-test_y = torch.tensor(test_y)
-val_y = torch.tensor(val_y)
-train_m = torch.tensor(train_m)
-test_m = torch.tensor(test_m)
-val_m = torch.tensor(val_m)
-
-
-
-
-
-
-train_data = TensorDataset(train_x, train_m, train_y)
-train_sampler = RandomSampler(train_data)
-train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
-
-val_data = TensorDataset(val_x, val_m, val_y)
-val_sampler = SequentialSampler(val_data)
-val_dataloader = DataLoader(val_data, sampler=val_sampler, batch_size=batch_size)
-
 from transformers import DistilBertForSequenceClassification, AdamW, DistilBertConfig
-
-num_labels = len(set(labels))
-
-model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=num_labels,output_attentions=False, output_hidden_states=False)
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(device)
 
-model = model.to(device)
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def load_data(batch_size):
+    from datasets import load_dataset
+    emotions = load_dataset('emotion')
+    emotions.set_format('pandas')
 
-print('Number of trainable parameters:', count_parameters(model), '\n', model)
+    df_train = emotions['train'][:]
+    df_val = emotions['validation'][:]
+    df_test = emotions['test'][:]
 
+    tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased', do_lower_case=True)
 
-learning_rate = 1e-5
-adam_epsilon = 1e-8
+    train_texts = df_train.text.to_numpy()
+    train_y = df_train.label.to_numpy()
+    val_texts = df_val.text.to_numpy()
+    val_y = df_val.label.to_numpy()
+    test_texts = df_test.text.to_numpy()
+    test_y = df_test.label.to_numpy()
 
-no_decay = ['bias', 'LayerNorm.weight']
-#optimizer_grouped_parameters = [
- #   {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-  #   'weight_decay_rate': 0.2},
-   # {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-    # 'weight_decay_rate': 0.0}
-#]
+    train_x = np.array([tokenizer.encode(text, max_length=300, pad_to_max_length=True) for text in train_texts])
+    val_x = np.array([tokenizer.encode(text, max_length=300, pad_to_max_length=True) for text in val_texts])
+    test_x = np.array([tokenizer.encode(text, max_length=300, pad_to_max_length=True) for text in test_texts])
 
-#optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, eps=adam_epsilon)
-optimizer=dGClip(model.parameters(), lr=float(sys.argv[1]), delta=float(sys.argv[2]))
-from transformers import get_linear_schedule_with_warmup
+    train_m = train_x > 0
+    val_m = val_x > 0
+    test_m = test_x > 0
 
-num_epochs = 15
-total_steps = len(train_dataloader) * num_epochs
+    train_x = torch.tensor(train_x)
+    test_x = torch.tensor(test_x)
+    val_x = torch.tensor(val_x)
+    train_y = torch.tensor(train_y)
+    test_y = torch.tensor(test_y)
+    val_y = torch.tensor(val_y)
+    train_m = torch.tensor(train_m)
+    test_m = torch.tensor(test_m)
+    val_m = torch.tensor(val_m)
 
+    train_data = TensorDataset(train_x, train_m, train_y)
+    train_sampler = RandomSampler(train_data)
+    train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
 
+    val_data = TensorDataset(val_x, val_m, val_y)
+    val_sampler = SequentialSampler(val_data)
+    val_dataloader = DataLoader(val_data, sampler=val_sampler, batch_size=batch_size)
 
-import time
+    num_labels = len(set(train_y.tolist()))
 
-def epoch_time(start_time, end_time):
-    elapsed_time = end_time - start_time
-    elapsed_mins = int(elapsed_time / 60)
-    elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
-    return elapsed_mins, elapsed_secs
-
-
-
-import numpy as np
-import random
-
-seed_val = 111
-
-random.seed(seed_val)
-np.random.seed(seed_val)
-torch.manual_seed(seed_val)
-torch.cuda.manual_seed_all(seed_val)
-
-
-
-train_losses = []
-val_losses = []
-num_mb_train = len(train_dataloader)
-num_mb_val = len(val_dataloader)
-
-if num_mb_val == 0:
-    num_mb_val = 1
-
-test_data = TensorDataset(test_x, test_m)
-test_sampler = SequentialSampler(test_data)
-test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=batch_size)
+    return train_dataloader, val_dataloader, test_x, test_m, test_y, tokenizer, num_labels
 
 
+def load_model(num_labels):
+    model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=num_labels,output_attentions=False, output_hidden_states=False)
+    model = model.to(device)
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Number of trainable parameters:{count_parameters(model)}')
+    return model
 
-acc=[]
-for n in range(num_epochs):
-    train_loss = 0
-    val_loss = 0
-    start_time = time.time()
 
-    for k, (mb_x, mb_m, mb_y) in enumerate(train_dataloader):
-        optimizer.zero_grad()
+def train_bert(args):
+    learning_rate = 1e-5
+    adam_epsilon = 1e-8
+    batch_size = 32
+
+    seed = args.seed
+    if args.seed is None:
+        seed = np.random.randint(1e6) # different seeds for each process
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    train_dataloader, val_dataloader, test_x, test_m, test_y, tokenizer, num_labels = load_data(batch_size)
+    model = load_model(num_labels)
+
+    if args.optim == 'adamw':
+        no_decay = ['bias', 'LayerNorm.weight']
+        # optimizer_grouped_parameters = [
+        #  #   {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+        #  #   'weight_decay_rate': 0.2},
+        #  # {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+        #    # 'weight_decay_rate': 0.0}
+        # ]
+        # optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, eps=adam_epsilon)
+        optimizer = AdamW(model.parameters(), lr=learning_rate, eps=adam_epsilon, weight_decay=args.weight_decay)
+
+    elif args.optim == 'dgclip':
+        optimizer=dGClip(model.parameters(), lr=args.lr, gamma=args.gamma, delta=args.delta, weight_decay=args.weight_decay)
+
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optim}")
+
+    num_epochs = args.epochs
+
+    def epoch_time(start_time, end_time):
+        elapsed_time = end_time - start_time
+        elapsed_mins = int(elapsed_time / 60)
+        elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
+        return elapsed_mins, elapsed_secs
+
+    test_data = TensorDataset(test_x, test_m)
+    test_sampler = SequentialSampler(test_data)
+    test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=batch_size)
+
+    time_now = datetime.now().strftime('%Y%m%d-%H%M%S')
+    writer = SummaryWriter(log_dir=f'logs/bert_finetuning.{args.optim}.{args.lr}.{args.gamma}.{args.delta}.{args.weight_decay}.{time_now}_{seed}', comment='bert_finetuning')
+
+    for n in range(num_epochs):
+        start_time = time.time()
+
+        clip_times = 0
         model.train()
-
-        mb_x = mb_x.to(device)
-        mb_m = mb_m.to(device)
-        mb_y = mb_y.to(device)
-
-        outputs = model(mb_x, attention_mask=mb_m, labels=mb_y)
-
-        loss = outputs[0]
-        #loss = model_loss(outputs[1], mb_y)
-        loss.backward()
-        optimizer.step()
-        train_loss += loss.data / num_mb_train
-        #train_losses.append(loss.data.cpu())
-    val_loss=0
-    with torch.no_grad():
-            model.eval()
-
-            for k, (mb_x, mb_m, mb_y) in enumerate(val_dataloader):
-                    mb_x = mb_x.to(device)
-                    mb_m = mb_m.to(device)
-                    mb_y = mb_y.to(device)
-
-                    outputs = model(mb_x, attention_mask=mb_m, labels=mb_y)
-
-                    loss = outputs[0]
-                    #loss = model_loss(outputs[1], mb_y)
-                    val_loss += loss.data / num_mb_val
-
-    print ("Validation loss after itaration %i: %f" % (n+1, val_loss))
-    val_losses.append(val_loss.cpu())
-
-    print ("\nTrain loss after itaration %i: %f" % (n+1, train_loss))
-    train_losses.append(train_loss.cpu())
-
-    outputs_new = []
-    with torch.no_grad():
-        model.eval()
-        for k, (mb_x, mb_m) in enumerate(test_dataloader):
-                mb_x = mb_x.to(device)
-                mb_m = mb_m.to(device)
-
-                output = model(mb_x, attention_mask=mb_m)
-                outputs_new.append(output[0].to('cpu'))
-        outputs = torch.cat(outputs_new)
-
-
-        _, predicted_values = torch.max(outputs, 1)
-        predicted_values = predicted_values.numpy()
-        true_values = test_y.numpy()
-        test_accuracy = np.sum(predicted_values == true_values) / len(true_values)
-        print ("Test Accuracy:", test_accuracy)
-        acc.append(test_accuracy)
-    with torch.no_grad():
-        model.eval()
-
-        for k, (mb_x, mb_m, mb_y) in enumerate(val_dataloader):
+        train_losses = []
+        for k, (mb_x, mb_m, mb_y) in enumerate(train_dataloader):
+            optimizer.zero_grad()
             mb_x = mb_x.to(device)
             mb_m = mb_m.to(device)
             mb_y = mb_y.to(device)
 
             outputs = model(mb_x, attention_mask=mb_m, labels=mb_y)
-
             loss = outputs[0]
-            #loss = model_loss(outputs[1], mb_y)
-            #val_loss += loss.data / num_mb_val
+            loss.backward()
+            grad_norm = optimizer.step()
+            clip_times += args.delta < (args.gamma / grad_norm)
+            train_losses.append(loss.item())
 
-        #print ("Validation loss after itaration %i: %f" % (n+1, val_loss))
-        #val_losses.append(val_loss.cpu())
+        writer.add_scalar('train_loss', np.mean(train_losses), n)
+        writer.add_scalar('grad_norm', grad_norm, n)
+        writer.add_scalar('grad_clip_ratio', clip_times * 1.0 / (k+1), n)
 
-    end_time = time.time()
-    epoch_mins, epoch_secs = epoch_time(start_time, end_time)
-    print(f'Time: {epoch_mins}m {epoch_secs}s')
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for k, (mb_x, mb_m, mb_y) in enumerate(val_dataloader):
+                mb_x = mb_x.to(device)
+                mb_m = mb_m.to(device)
+                mb_y = mb_y.to(device)
+                outputs = model(mb_x, attention_mask=mb_m, labels=mb_y)
+                loss = outputs[0]
+                val_losses.append(loss.item())
 
+        writer.add_scalar('val_loss', np.mean(val_losses), n)
 
-import pickle
-import os
+        print (f"\nTrain loss after itaration {n}: {np.mean(train_losses)}")
+        print (f"Validation loss after itaration {n}: {np.mean(val_losses)}")
+        print (f"Gradient clipping times: {clip_times}")
 
-out_dir = './model'
+        outputs = []
+        with torch.no_grad():
+            for k, (mb_x, mb_m) in enumerate(test_dataloader):
+                mb_x = mb_x.to(device)
+                mb_m = mb_m.to(device)
 
-if not os.path.exists(out_dir):
-    os.makedirs(out_dir)
+                output = model(mb_x, attention_mask=mb_m)
+                outputs.append(output[0].to('cpu'))
 
-model_to_save = model.module if hasattr(model, 'module') else model
-model_to_save.save_pretrained(out_dir)
-tokenizer.save_pretrained(out_dir)
+            outputs = torch.cat(outputs)
 
-with open(out_dir + '/train_losses.pkl', 'wb') as f:
-    pickle.dump(train_losses, f)
+            _, predicted_values = torch.max(outputs, 1)
+            predicted_values = predicted_values.numpy()
+            true_values = test_y.numpy()
+            test_acc = np.sum(predicted_values == true_values) / len(true_values)
+            print (f"Test accuracy: {test_acc}")
+        writer.add_scalar('test_acc', test_acc, n)
 
-with open(out_dir + '/val_losses.pkl', 'wb') as f:
-    pickle.dump(val_losses, f)
+        test_losses = []
+        with torch.no_grad():
+            for k, (mb_x, mb_m, mb_y) in enumerate(val_dataloader):
+                mb_x = mb_x.to(device)
+                mb_m = mb_m.to(device)
+                mb_y = mb_y.to(device)
+                outputs = model(mb_x, attention_mask=mb_m, labels=mb_y)
+                loss = outputs[0]
+                test_losses.append(loss.item())
+        writer.add_scalar('test_loss', np.mean(test_losses), n)
+        print(f"Test loss: {np.mean(test_losses)}")
 
+        end_time = time.time()
+        epoch_mins, epoch_secs = epoch_time(start_time, end_time)
+        print(f'Time: {epoch_mins}m {epoch_secs}s')
 
-out_dir = './model'
-
-model = DistilBertForSequenceClassification.from_pretrained(out_dir)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = model.to(device)
-
-with open(out_dir + '/train_losses.pkl', 'rb') as f:
-    train_losses = pickle.load(f)
-    
-with open(out_dir + '/val_losses.pkl', 'rb') as f:
-    val_losses = pickle.load(f)
-
-from matplotlib import pyplot as plt
-
-epochs=[]
-for i in range(0,len(train_losses)):
-    epochs.append(i)
-
-
-ticks=[]
-
-for i in range(0,num_epochs):
-    ticks.append(i)
-
-plt.figure()
-plt.plot(train_losses,label="Train Loss")
-plt.plot(val_losses, label="Validation Loss")
-plt.xlabel("Number of Epochs")
-plt.ylabel("Loss Value")
-plt.xticks(ticks, ticks,rotation="vertical")
-plt.xlim(0,len(train_losses)-1)
-plt.legend()
-plt.savefig("bert_loss.png")
+    return model, tokenizer
 
 
-with open("loss_values.txt","w") as f:
-	for i in range(num_epochs):
-		f.write(str(i))
-		f.write("\t")
-		f.write(str(train_losses[i]))
-		f.write("\t")
-		f.write(str(val_losses[i]))
-		f.write("\n")
-f.close()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='PyTorch BERT Fine Tuning')
+    parser.add_argument('--optim', default='dgclip', choices=['adam', 'dgclip', 'sgd'],)
+    parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
+    parser.add_argument('--lr', default=0.0005, type=float, help='learning rate')
+    parser.add_argument('--gamma', default=1.0, type=float, help='gamma')
+    parser.add_argument('--delta', default=0.001, type=float, help='delta')
+    parser.add_argument('--weight_decay', default=1e-5, type=float, help='weight decay')
+    parser.add_argument('--seed', default=None, type=int, help='random seed (default: None)')
+    parser.add_argument('--device', default=0, type=int, help='GPU device')
+    args = parser.parse_args()
 
-with open("acc_values.txt","w") as f:
-        for i in range(num_epochs):
-                f.write(str(i))
-                f.write("\t")
-                f.write(str(acc[i]))
-                f.write("\n")
-f.close()
-
-batch_size = 32
-
-test_data = TensorDataset(test_x, test_m)
-test_sampler = SequentialSampler(test_data)
-test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=batch_size)
-
-outputs = []
-with torch.no_grad():
-    model.eval()
-    for k, (mb_x, mb_m) in enumerate(test_dataloader):
-        mb_x = mb_x.to(device)
-        mb_m = mb_m.to(device)
-        output = model(mb_x, attention_mask=mb_m)
-        outputs.append(output[0].to('cpu'))
-
-outputs = torch.cat(outputs)
-
-
-_, predicted_values = torch.max(outputs, 1)
-predicted_values = predicted_values.numpy()
-true_values = test_y.numpy()
-test_accuracy = np.sum(predicted_values == true_values) / len(true_values)
-print ("Test Accuracy:", test_accuracy)
-
-print("end")
+    model, tokenizer = train_bert(args)
+    # save_model(model, tokenizer, train_losses, val_losses)
+    # plot_loss()
+    # test_model(model, test_x, test_m, test_y)
