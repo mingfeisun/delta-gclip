@@ -18,9 +18,6 @@ from transformers import DistilBertTokenizer
 from transformers import DistilBertForSequenceClassification, AdamW, DistilBertConfig
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(device)
-
 
 def load_data(batch_size):
     from datasets import load_dataset
@@ -71,7 +68,7 @@ def load_data(batch_size):
     return train_dataloader, val_dataloader, test_x, test_m, test_y, tokenizer, num_labels
 
 
-def load_model(num_labels):
+def load_model(num_labels, device):
     model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=num_labels,output_attentions=False, output_hidden_states=False)
     model = model.to(device)
     def count_parameters(model):
@@ -81,6 +78,9 @@ def load_model(num_labels):
 
 
 def train_bert(args):
+    device = torch.device(f'cuda:{args.device}') # Select best available device
+    print(device)
+
     learning_rate = 1e-5
     adam_epsilon = 1e-8
     batch_size = 32
@@ -95,7 +95,7 @@ def train_bert(args):
     torch.cuda.manual_seed_all(seed)
 
     train_dataloader, val_dataloader, test_x, test_m, test_y, tokenizer, num_labels = load_data(batch_size)
-    model = load_model(num_labels)
+    model = load_model(num_labels, device)
 
     if args.optim == 'adamw':
         no_decay = ['bias', 'LayerNorm.weight']
@@ -145,6 +145,8 @@ def train_bert(args):
             loss = outputs[0]
             loss.backward()
             grad_norm = optimizer.step()
+            if grad_norm is None:
+                grad_norm = 1.0
             clip_times += args.delta < (args.gamma / grad_norm)
             train_losses.append(loss.item())
 
@@ -208,7 +210,7 @@ def train_bert(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch BERT Fine Tuning')
-    parser.add_argument('--optim', default='dgclip', choices=['adam', 'dgclip', 'sgd'],)
+    parser.add_argument('--optim', default='dgclip', choices=['adamw', 'dgclip', 'sgd'],)
     parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
     parser.add_argument('--lr', default=0.0005, type=float, help='learning rate')
     parser.add_argument('--gamma', default=1.0, type=float, help='gamma')

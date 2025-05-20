@@ -10,8 +10,6 @@ import torchvision.transforms as transforms
 
 from torch.utils.tensorboard import SummaryWriter
 
-from vision_transformer import vit_tiny
-
 import sys
 sys.path.insert(1, '../optim')
 
@@ -97,7 +95,15 @@ def train_vit(args):
 
     train_loader, _, test_loader = load_dataset(64)
 
-    model = vit_tiny(num_classes=10)
+    if args.vit_type == 'tiny':
+        from vision_transformer import vit_tiny
+        model = vit_tiny(num_classes=10)
+    elif args.vit_type == 'small':
+        from vision_transformer import vit_small
+        model = vit_small(num_classes=10)
+    else:
+        raise ValueError(f"Unknown ViT type: {args.vit_type}")
+
     print('Number of parameters: ', count_vars(model))
 
     device = torch.device(f'cuda:{args.device}') # Select best available device
@@ -130,7 +136,7 @@ def train_vit(args):
         raise ValueError(f"Unknown optimizer: {args.optim}")
 
     time_now = datetime.now().strftime('%Y%m%d-%H%M%S')
-    writer = SummaryWriter(log_dir=f'logs/vit_cifar.{args.optim}.{args.lr}.{args.gamma}.{args.delta}.{args.weight_decay}.{time_now}_{seed}', comment='vit_cifar')
+    writer = SummaryWriter(log_dir=f'logs/vit-{args.vit_type}_cifar.{args.optim}.{args.lr}.{args.gamma}.{args.delta}.{args.weight_decay}.{time_now}_{seed}', comment='vit_cifar')
 
     import time
     st = time.time()
@@ -203,6 +209,7 @@ def train_vit(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PyTorch CIFAR ViT Training')
+    parser.add_argument('--vit_type', default='tiny', choices=['tiny', 'small'],)
     parser.add_argument('--optim', default='dgclip', choices=['adam', 'dgclip', 'sgd'],)
     parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
     parser.add_argument('--lr', default=0.0005, type=float, help='learning rate')
